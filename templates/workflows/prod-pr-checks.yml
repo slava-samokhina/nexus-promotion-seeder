@@ -1,0 +1,136 @@
+# .github/workflows/prod-pr-checks.yml
+# -----------------------------------------------------------------------------
+# PROD PROMOTION-PR GATE. Same shape as the UAT checks.
+#
+# Runs on EVERY PR to main (not path-filtered) so the required `prod-checks`
+# status always reports. A PR that does not touch release/prod/** passes
+# immediately — dev PRs and UAT promotion PRs are not blocked by this job.
+# A PR that does touch release/prod/** runs the full 6-check gate.
+#
+# No `environment:` — reads repository-level variables. The human gate for prod
+# is CODEOWNERS on /release/prod/, not an environment reviewer.
+# gcloud only (read-only), no Docker. Keyless WIF as prod-promoter.
+# -----------------------------------------------------------------------------
+name: PROD promotion checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: prod-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  prod-checks:
+    name: prod-checks
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    env:
+      UAT_PROJECT_ID: ${{ vars.UAT_PROJECT_ID }}
+      PROD_PROJECT_ID: ${{ vars.PROD_PROJECT_ID }}
+      REGION: ${{ vars.GCP_REGION }}
+      UAT_AR: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.UAT_PROJECT_ID }}/${{ vars.UAT_AR_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine PR scope
+        id: scope
+        run: |
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          echo "changed files:"; echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^release/prod/'; then
+            echo "promotion=true" >> "$GITHUB_OUTPUT"
+            echo "PROD promotion PR — running the full gate."
+          else
+            echo "promotion=false" >> "$GITHUB_OUTPUT"
+            echo "No release/prod/** changes — nothing to verify, passing."
+          fi
+
+      # CHECK 4: only release/prod/** changed.
+      - name: Check 4 — only release/prod/** changed
+        if: steps.scope.outputs.promotion == 'true'
+        run: |
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}")
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -vqE '^release/prod/'; then
+            echo "Prod promotion PR touched files outside release/prod/ — rejected."; exit 1
+          fi
+
+      # CHECK 6: the PR branch is one the "Promote app to prod" button creates.
+      - name: Check 6 — provenance (promote-prod branch)
+        if: steps.scope.outputs.promotion == 'true'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          case "$HEAD_REF" in
+            promote-prod/*) echo "ok: $HEAD_REF" ;;
+            *) echo "Not a prod promotion branch ($HEAD_REF)."; exit 1 ;;
+          esac
+
+      - name: Parse desired state
+        id: ds
+        if: steps.scope.outputs.promotion == 'true'
+        run: |
+          APP=$(ls release/prod/*.json | head -n1 | xargs -I{} basename {} .json)
+          F="release/prod/${APP}.json"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+          echo "digest=$(jq -r .uat_digest "$F")" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud (read-only)
+        if: steps.scope.outputs.promotion == 'true'
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.PROD_PROMOTER_SA }}
+      - uses: google-github-actions/setup-gcloud@v3
+        if: steps.scope.outputs.promotion == 'true'
+
+      # CHECK 1: digest is the real UAT artifact (exists in apps-uat).
+      - name: Check 1 — digest exists in uat AR
+        if: steps.scope.outputs.promotion == 'true'
+        run: |
+          gcloud artifacts docker images describe \
+            "${UAT_AR}/${{ steps.ds.outputs.app }}@${{ steps.ds.outputs.digest }}" \
+            --project="$UAT_PROJECT_ID" >/dev/null \
+            || { echo "Digest not found in UAT AR — blocking a digest that was not promoted to UAT."; exit 1; }
+
+      # CHECK 2: the UAT image URL is signed (re-attested when it was promoted to UAT).
+      - name: Check 2 — uat signature present
+        if: steps.scope.outputs.promotion == 'true'
+        run: |
+          COUNT=$(gcloud container binauthz attestations list \
+            --attestor="${{ vars.ATTESTOR }}" --attestor-project="$UAT_PROJECT_ID" \
+            --artifact-url="${UAT_AR}/${{ steps.ds.outputs.app }}@${{ steps.ds.outputs.digest }}" \
+            --format='value(name)' 2>/dev/null | wc -l | tr -d ' ')
+          test "$COUNT" -ge 1 || { echo "No UAT attestation for this digest."; exit 1; }
+
+      # CHECK 3: no unresolved critical vulns on the UAT image.
+      - name: Check 3 — vuln scan clean
+        if: steps.scope.outputs.promotion == 'true'
+        run: |
+          CRIT=$(gcloud artifacts docker images describe \
+            "${UAT_AR}/${{ steps.ds.outputs.app }}@${{ steps.ds.outputs.digest }}" \
+            --project="$UAT_PROJECT_ID" --show-package-vulnerability \
+            --format='value(package_vulnerability_summary.vulnerabilities.CRITICAL)' 2>/dev/null || echo "")
+          test -z "$CRIT" || { echo "Critical vulnerabilities present: $CRIT"; exit 1; }
+
+      # CHECK 5: prod infra exists.
+      - name: Check 5 — prod infra exists
+        if: steps.scope.outputs.promotion == 'true'
+        run: |
+          gcloud artifacts repositories describe "${{ vars.PROD_AR_REPO }}" \
+            --project="$PROD_PROJECT_ID" --location="$REGION" >/dev/null \
+            || { echo "Prod Artifact Registry repo missing."; exit 1; }
+          gcloud iam service-accounts describe "${{ vars.PROD_RUNTIME_SA }}" \
+            --project="$PROD_PROJECT_ID" >/dev/null \
+            || { echo "Prod runtime SA missing."; exit 1; }

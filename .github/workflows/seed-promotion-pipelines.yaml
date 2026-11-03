@@ -1,0 +1,128 @@
+# Seed UAT + Prod promotion pipelines into a target app repository.
+#
+# Templates and the declarative manifest live in this repo. Dispatch with
+# the target owner/repo; the script copies workflows, creates environments,
+# sets repository variables, applies settings, and upserts the main-guard
+# ruleset. Same GitHub App auth pattern as scion-deployment vending:
+# actions/create-github-app-token mints a token scoped to the target.
+#
+# On this seeder repo (nexus-promotion-seeder):
+#   Settings → Secrets and variables → Actions → Secrets
+#     NEXUS_APP_PRIVATE_KEY
+#       The full PEM, including the BEGIN and END lines.
+#   Settings → Secrets and variables → Actions → Variables
+#     NEXUS_APP_CLIENT_ID
+#       The app Client ID from the GitHub App settings page
+#       (not the numeric App ID).
+#
+# Install the app on the target owner (org or user) and include the
+# target repository (or All repositories). Required app permissions:
+#   Contents: R/W, Pull requests: R/W, Administration: R/W,
+#   Environments: R/W, Variables: R/W, Workflows: R/W (for pushing
+#   workflow files), Organization/members as needed for CODEOWNERS teams.
+
+name: seed-promotion-pipelines
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "owner/repo to seed (e.g. slava-samokhina/target-repo)"
+        required: true
+        type: string
+      tiers:
+        description: "both | uat | prod"
+        required: false
+        default: both
+        type: string
+      codeowners_owner:
+        description: "CODEOWNERS handle without or with @ (e.g. slava-samokhina or @org/team)"
+        required: true
+        type: string
+      push_mode:
+        description: "direct | pr  (direct for first seed before ruleset exists)"
+        required: false
+        default: direct
+        type: string
+      apply_ruleset:
+        description: "true | false"
+        required: false
+        default: "true"
+        type: string
+      add_prod_check:
+        description: "phase 2: add prod-checks to the ruleset after it has run once"
+        required: false
+        default: "false"
+        type: string
+      resolved_vars:
+        description: 'JSON of after-project vars, e.g. {"UAT_PROJECT_ID":"...","WIF_PROVIDER":"..."}'
+        required: false
+        default: "{}"
+        type: string
+
+concurrency:
+  group: seed-${{ github.event.inputs.target_repo }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # The APP token (not GITHUB_TOKEN) writes to the target.
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require settings
+        env:
+          NEXUS_APP_CLIENT_ID: ${{ vars.NEXUS_APP_CLIENT_ID }}
+          NEXUS_APP_PRIVATE_KEY: ${{ secrets.NEXUS_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          for v in NEXUS_APP_CLIENT_ID NEXUS_APP_PRIVATE_KEY; do
+            [ -n "${!v}" ] || { echo "Missing $v"; exit 1; }
+          done
+
+      - name: Parse target
+        id: target
+        env:
+          TARGET_REPO: ${{ github.event.inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          case "$TARGET_REPO" in
+            */*) ;;
+            *) echo "target_repo must be owner/repo" >&2; exit 1 ;;
+          esac
+          owner="${TARGET_REPO%%/*}"
+          repo="${TARGET_REPO#*/}"
+          if [ -z "$owner" ] || [ -z "$repo" ] || [ "$owner" = "$TARGET_REPO" ]; then
+            echo "target_repo must be owner/repo" >&2
+            exit 1
+          fi
+          echo "owner=$owner" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+
+      - name: GitHub App token (scoped to the TARGET repo)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.NEXUS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.NEXUS_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.repo }}
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Seed
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo }}
+          TIERS: ${{ github.event.inputs.tiers }}
+          CODEOWNERS_OWNER: ${{ github.event.inputs.codeowners_owner }}
+          PUSH_MODE: ${{ github.event.inputs.push_mode }}
+          APPLY_RULESET: ${{ github.event.inputs.apply_ruleset }}
+          ADD_PROD_CHECK: ${{ github.event.inputs.add_prod_check }}
+          RESOLVED_VARS: ${{ github.event.inputs.resolved_vars }}
+        run: python3 .github/scripts/seed_promotion_pipelines.py

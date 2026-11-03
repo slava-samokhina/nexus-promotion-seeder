@@ -1,0 +1,177 @@
+name: UAT Promote
+
+# Fires after a promotion PR auto-merges into main (release/uat/** changed).
+#
+# The job declares `environment: uat`, which is the SINGLE HUMAN GATE: it pauses
+# for a Required Reviewer's approval before anything touches GCP. After approval
+# it copies the dev image digest-for-digest into the UAT repo, re-attests it for
+# the new UAT image URL, deploys to Cloud Run with no traffic, smoke-tests the
+# candidate, then shifts 100% of traffic.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "release/uat/**"
+  workflow_dispatch: {} # allow manual re-runs; still gated by the `uat` environment
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: uat-promote
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Copy, re-attest, deploy to UAT
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    environment: uat # <-- human approval gate (Required Reviewers)
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (WIF, keyless)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.PROMOTER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+        with:
+          install_components: beta # sign-and-create is a `gcloud beta` command
+
+      # No Docker. `gcrane` is a standalone Go binary (part of go-containerregistry)
+      # that authenticates to Artifact Registry directly via the WIF credentials
+      # (Application Default Credentials) set up by the auth step above.
+      - name: Install gcrane
+        run: |
+          set -euo pipefail
+          VER="${{ vars.GCRANE_VERSION }}"
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${VER}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xzf - gcrane
+          sudo mv gcrane /usr/local/bin/gcrane
+          gcrane version || true
+
+      - name: Promote each release manifest
+        run: |
+          set -euo pipefail
+
+          REGION="${{ vars.GCP_REGION }}"
+          DEV_PROJECT="${{ vars.DEV_PROJECT_ID }}"
+          UAT_PROJECT="${{ vars.UAT_PROJECT_ID }}"
+          DEV_REPO="${{ vars.DEV_AR_REPO }}"
+          UAT_REPO="${{ vars.UAT_AR_REPO }}"
+
+          for f in release/uat/*.json; do
+            echo "::group::Promoting $f"
+            APP="$(jq -r .app "$f")"
+            DIGEST="$(jq -r .dev_digest "$f")"
+            RELEASE="$(jq -r .release "$f")"
+            VERSION="${RELEASE##*/}"   # last path segment of uat/<app>/<version>
+
+            SRC="${REGION}-docker.pkg.dev/${DEV_PROJECT}/${DEV_REPO}/${APP}@${DIGEST}"
+            DST_REPO="${REGION}-docker.pkg.dev/${UAT_PROJECT}/${UAT_REPO}/${APP}"
+
+            echo "== 1. Copy dev -> uat (digest-preserving) =="
+            gcrane cp "$SRC" "${DST_REPO}:${VERSION}"
+
+            echo "== 2. Assert the digest did not change =="
+            UAT_DIGEST="$(gcrane digest "${DST_REPO}:${VERSION}")"
+            echo "dev digest: $DIGEST"
+            echo "uat digest: $UAT_DIGEST"
+            if [ "$UAT_DIGEST" != "$DIGEST" ]; then
+              echo "::error::Digest changed during copy ($DIGEST -> $UAT_DIGEST). Aborting — this must be a byte-identical promotion."
+              exit 1
+            fi
+            UAT_IMAGE="${DST_REPO}@${UAT_DIGEST}"
+
+            echo "== 3. Scan for CRITICAL vulns (gcloud / Artifact Analysis) =="
+            # Same gcloud-only check as uat-pr-checks.yml. Reads Artifact Analysis
+            # results for the digest; empty (no findings / scanning off) => pass.
+            CRIT="$(gcloud artifacts docker images describe "$UAT_IMAGE" \
+              --project="$UAT_PROJECT" --show-package-vulnerability \
+              --format='value(package_vulnerability_summary.vulnerabilities.CRITICAL)' 2>/dev/null || echo "")"
+            if [ -n "$CRIT" ]; then
+              echo "::error::Critical vulnerabilities present: $CRIT"
+              exit 1
+            fi
+            echo "OK — no CRITICAL vulnerabilities."
+
+            echo "== 4. Re-attest the UAT image URL for Binary Authorization =="
+            gcloud beta container binauthz attestations sign-and-create \
+              --project="$UAT_PROJECT" \
+              --artifact-url="$UAT_IMAGE" \
+              --attestor="${{ vars.ATTESTOR }}" --attestor-project="$UAT_PROJECT" \
+              --keyversion-project="$UAT_PROJECT" --keyversion-location=global \
+              --keyversion-keyring="${{ vars.KMS_KEYRING }}" \
+              --keyversion-key="${{ vars.KMS_KEY }}" \
+              --keyversion="${{ vars.KMS_KEYVERSION }}" --quiet \
+              || echo "(attestation already exists — continuing)"
+
+            SERVICE="${APP}-uat"
+            # Cloud Run rejects --no-traffic when CREATING a service, so branch on
+            # whether the service already exists.
+            if gcloud run services describe "$SERVICE" \
+                 --project="$UAT_PROJECT" --region="$REGION" >/dev/null 2>&1; then
+              FIRST_DEPLOY=0
+            else
+              FIRST_DEPLOY=1
+            fi
+
+            if [ "$FIRST_DEPLOY" = "1" ]; then
+              echo "== 5. First deploy: create $SERVICE (serves traffic immediately) =="
+              gcloud run deploy "$SERVICE" \
+                --project="$UAT_PROJECT" --region="$REGION" \
+                --image="$UAT_IMAGE" \
+                --service-account="${{ vars.UAT_RUNTIME_SA }}" \
+                --binary-authorization=default \
+                --allow-unauthenticated --quiet
+              SMOKE_URL="$(gcloud run services describe "$SERVICE" \
+                --project="$UAT_PROJECT" --region="$REGION" \
+                --format='value(status.url)')"
+            else
+              echo "== 5. Deploy new revision with NO traffic, tagged 'candidate' =="
+              gcloud run deploy "$SERVICE" \
+                --project="$UAT_PROJECT" --region="$REGION" \
+                --image="$UAT_IMAGE" \
+                --service-account="${{ vars.UAT_RUNTIME_SA }}" \
+                --binary-authorization=default \
+                --no-traffic --tag=candidate \
+                --allow-unauthenticated --quiet
+              SMOKE_URL="$(gcloud run services describe "$SERVICE" \
+                --project="$UAT_PROJECT" --region="$REGION" --format=json \
+                | jq -r '.status.traffic[] | select(.tag=="candidate") | .url')"
+            fi
+
+            echo "== 6. Smoke test (${SMOKE_URL}/health) =="
+            if [ -z "$SMOKE_URL" ] || [ "$SMOKE_URL" = "null" ]; then
+              echo "::error::Could not resolve a URL to smoke-test for $SERVICE."
+              exit 1
+            fi
+            CODE=""
+            for i in $(seq 1 12); do
+              CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${SMOKE_URL}/health" || true)"
+              echo "attempt $i: HTTP $CODE"
+              [ "$CODE" = "200" ] && break
+              sleep 5
+            done
+            if [ "$CODE" != "200" ]; then
+              echo "::error::Smoke test failed for $SERVICE (last HTTP $CODE). NOT promoting traffic."
+              exit 1
+            fi
+
+            if [ "$FIRST_DEPLOY" = "0" ]; then
+              echo "== 7. Shift 100% of traffic to the new revision =="
+              gcloud run services update-traffic "$SERVICE" \
+                --project="$UAT_PROJECT" --region="$REGION" \
+                --to-latest --quiet
+            fi
+
+            LIVE_URL="$(gcloud run services describe "$SERVICE" \
+              --project="$UAT_PROJECT" --region="$REGION" \
+              --format='value(status.url)')"
+            echo "✅ $APP promoted to UAT: $LIVE_URL (digest $UAT_DIGEST)"
+            echo "::endgroup::"
+          done
