@@ -59,6 +59,17 @@ def env(name: str, default: str | None = None) -> str:
     return value
 
 
+def _redact(args: list[str]) -> str:
+    """Avoid printing tokens embedded in git remote URLs."""
+    out = []
+    for a in args:
+        if "x-access-token:" in a:
+            out.append(re.sub(r"x-access-token:[^@]+@", "x-access-token:***@", a))
+        else:
+            out.append(a)
+    return " ".join(out)
+
+
 def run(
     args: list[str],
     *,
@@ -67,7 +78,7 @@ def run(
     capture: bool = False,
     input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
-    log(f"+ {' '.join(args)}")
+    log(f"+ {_redact(args)}")
     return subprocess.run(
         args,
         cwd=str(cwd) if cwd else None,
@@ -355,16 +366,13 @@ def commit_and_push(
 
 
 def ensure_environment(target_repo: str, name: str) -> None:
-    # PUT is idempotent create-or-update with no reviewers.
+    # Bare environment, no protection rules. Sending reviewers=[] makes GitHub
+    # treat it as a required-reviewers rule (paid plans only) and 422 on free
+    # personal accounts — omit protection fields entirely.
     gh_api(
         "PUT",
         f"repos/{target_repo}/environments/{name}",
-        input_json={
-            "wait_timer": 0,
-            "prevent_self_review": False,
-            "reviewers": [],
-            "deployment_branch_policy": None,
-        },
+        input_json={},
     )
     log(f"environment {name}: upserted")
 
@@ -518,6 +526,24 @@ def build_ruleset_payload(
     }
 
 
+def _gh_api_raw(method: str, path: str, input_json: dict | None = None) -> tuple[int, str]:
+    """Return (http_status_or_-1, stdout+stderr). Does not die on failure."""
+    args = ["gh", "api", "-X", method, path, "--include"]
+    body = None
+    if input_json is not None:
+        args += ["--input", "-"]
+        body = json.dumps(input_json)
+    result = run(args, check=False, capture=True, input_text=body)
+    blob = (result.stdout or "") + (result.stderr or "")
+    status = -1
+    match = re.search(r"HTTP/[\d.]+ (\d+)", blob)
+    if match:
+        status = int(match.group(1))
+    elif result.returncode == 0:
+        status = 200
+    return status, blob
+
+
 def upsert_ruleset(
     target_repo: str,
     manifest: dict,
@@ -527,11 +553,29 @@ def upsert_ruleset(
     payload = build_ruleset_payload(manifest, selected, add_prod_check)
     name = payload["name"]
 
-    listed = gh_api("GET", f"repos/{target_repo}/rulesets", allow_statuses=())
+    status, blob = _gh_api_raw("GET", f"repos/{target_repo}/rulesets")
+    if status == 403:
+        log(
+            f"ruleset {name}: SKIPPED — repository rulesets are unavailable on this "
+            "plan (private personal repos need GitHub Pro; org repos need Team+). "
+            "Files/envs/vars were still seeded. Re-run with apply_ruleset=true on an "
+            "eligible repo, or make the repo public."
+        )
+        return "skipped:plan"
+
+    if status not in (200, 201):
+        die(f"gh api GET repos/{target_repo}/rulesets -> HTTP {status}\n{blob}")
+
+    # Strip response headers; body is the last JSON value.
+    body_text = blob
+    if "\r\n\r\n" in blob:
+        body_text = blob.split("\r\n\r\n", 1)[-1]
+    elif "\n\n" in blob:
+        body_text = blob.split("\n\n", 1)[-1]
     try:
-        rulesets = json.loads(listed.stdout or "[]")
+        rulesets = json.loads(body_text.strip() or "[]")
     except json.JSONDecodeError:
-        die(f"could not parse rulesets list: {listed.stdout}")
+        die(f"could not parse rulesets list: {body_text}")
 
     existing_id = None
     for item in rulesets:
@@ -540,19 +584,27 @@ def upsert_ruleset(
             break
 
     if existing_id is None:
-        gh_api(
-            "POST",
-            f"repos/{target_repo}/rulesets",
-            input_json=payload,
+        status, blob = _gh_api_raw(
+            "POST", f"repos/{target_repo}/rulesets", input_json=payload
         )
+        if status == 403:
+            log(f"ruleset {name}: SKIPPED — create forbidden (HTTP 403)")
+            return "skipped:plan"
+        if status not in (200, 201):
+            die(f"POST rulesets -> HTTP {status}\n{blob}")
         log(f"ruleset {name}: created")
         return "created"
 
-    gh_api(
+    status, blob = _gh_api_raw(
         "PUT",
         f"repos/{target_repo}/rulesets/{existing_id}",
         input_json=payload,
     )
+    if status == 403:
+        log(f"ruleset {name}: SKIPPED — update forbidden (HTTP 403)")
+        return "skipped:plan"
+    if status not in (200, 201):
+        die(f"PUT rulesets/{existing_id} -> HTTP {status}\n{blob}")
     log(f"ruleset {name}: updated (id={existing_id})")
     return f"updated:{existing_id}"
 

@@ -122,6 +122,11 @@ Constant variables (`GCP_REGION`, AR repo names, attestor/KMS, `RUNNER_LABELS`,
 3. **GCP is out of scope.** This seeder writes GitHub config only. SAs, WIF,
    KMS, attestors, and Artifact Registry come from project creation; pass
    their IDs via `resolved_vars`.
+4. **Ruleset plan limits.** Repository rulesets on a **private personal** repo
+   need GitHub Pro (org repos need Team+). If the API returns 403, the seeder
+   still finishes files/envs/vars and reports `ruleset: skipped:plan`. For a
+   full ruleset test, use a public personal repo or an org repo under
+   `nexus-software-factory`.
 
 ## What gets written on the target
 
