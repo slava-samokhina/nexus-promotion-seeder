@@ -86,10 +86,9 @@ Actions → **seed-promotion-pipelines** → Run workflow:
 |---|---|---|
 | `target_repo` | `slava-samokhina/target-repo` | `owner/repo` |
 | `tiers` | `both` | `both` \| `uat` \| `prod` |
-| `codeowners_owner` | `slava-samokhina` | with or without `@`; teams as `org/team` |
+| `codeowners_owner` | *(empty)* | empty uses repo admins; or `slava-samokhina` / `org/team` |
 | `push_mode` | `direct` | first seed: `direct`; re-seed behind ruleset: `pr` |
 | `apply_ruleset` | `true` | set `false` to only land files/vars |
-| `add_prod_check` | `false` | phase 2 only — see ordering below |
 | `resolved_vars` | `{}` | JSON of project-specific vars once GCP exists |
 
 Example `resolved_vars` after UAT/Prod projects exist:
@@ -115,42 +114,44 @@ Constant variables (`GCP_REGION`, AR repo names, attestor/KMS, `RUNNER_LABELS`,
 1. **Files before ruleset.** The ruleset requires PR + code-owner review +
    status checks. First seed uses `push_mode=direct`, then applies the
    ruleset last. Re-seeds on a protected repo use `push_mode=pr`.
-2. **`prod-checks` phase 2.** A required status check must have been reported
-   at least once before the ruleset will accept it. Phase 1 requires only
-   `checks` (UAT). After a prod PR has run `prod-pr-checks` once, re-dispatch
-   with `add_prod_check=true`.
-3. **GCP is out of scope.** This seeder writes GitHub config only. SAs, WIF,
-   KMS, attestors, and Artifact Registry come from project creation; pass
-   their IDs via `resolved_vars`.
+2. **GCP project identifiers have no value until the projects exist.** The
+   seeder still creates every variable. Constants match scion-testing.
+   `DEV_PROJECT_ID`, `UAT_PROJECT_ID`, `PROD_PROJECT_ID`, `PROMOTER_SA`,
+   `UAT_RUNTIME_SA`, `PROD_PROMOTER_SA`, `PROD_RUNTIME_SA`, and
+   `WIF_PROVIDER` are set to `PENDING` unless `resolved_vars` supplies them.
+   GitHub will not store an empty variable.
+3. **CODEOWNERS are the target repo's admins** unless `codeowners_owner` is
+   set. A user-owned repo lists that user. An org repo lists people with
+   admin (the owners vending granted). It does not invent a team.
 4. **Ruleset plan limits.** Repository rulesets on a **private personal** repo
-   need GitHub Pro (org repos need Team+). If the API returns 403, the seeder
-   still finishes files/envs/vars and reports `ruleset: skipped:plan`. For a
-   full ruleset test, use a public personal repo or an org repo under
-   `nexus-software-factory`.
+   need GitHub Pro (org repos on Enterprise/Team are fine, including internal).
+   If the API returns 403, the seeder still finishes files/envs/vars and
+   reports `ruleset: skipped:plan`.
 
 ## What gets written on the target
 
-- `.github/workflows/` — selected tier workflows (6 for `both`)
-- `.github/CODEOWNERS` — `/release/uat/` and/or `/release/prod/`
+- `.github/workflows/` — the four promotion workflows (`uat-pr-checks`, `uat-promote`, `prod-pr-checks`, `prod-promote`)
+- `.github/CODEOWNERS` — `/release/uat/` and `/release/prod/` owned by the repo admins
 - `release/uat/.gitkeep`, `release/prod/.gitkeep`
-- Environments `uat` and/or `prod` (no required reviewers)
-- Repository variables (constants + any provided `resolved_vars`)
+- Environments `uat` and `prod` (no protection rules)
+- All 18 repository variables (8 project-specific ones are `PENDING` until `resolved_vars`)
 - `allow_auto_merge=true`, Actions can approve PRs, default workflow perms `read`
-- Ruleset `main-guard` on `~DEFAULT_BRANCH`
+- Ruleset `main-guard` requiring `uat-checks` and `prod-checks`
 
 All writes are upserts — safe to re-run.
 
 ## Manual test plan
 
 1. **Blank target** (`slava-samokhina/target-repo`): dispatch
-   `tiers=both`, `codeowners_owner=slava-samokhina`, `push_mode=direct`,
-   `apply_ruleset=true`, `add_prod_check=false`, `resolved_vars={}`.
-   Expect 6 workflows, CODEOWNERS, envs, constant vars, ruleset with only
-   `checks` required.
+   `target_repo=slava-samokhina/target-repo`, `tiers=both`,
+   leave `codeowners_owner` empty, `push_mode=direct`,
+   `apply_ruleset=true`, `resolved_vars={}`.
+   Expect 4 workflows, CODEOWNERS set to the repo admins, both envs,
+   all 18 variables (project ones `PENDING`), ruleset requiring
+   `uat-checks` and `prod-checks`.
 2. **Idempotency:** re-dispatch same inputs → no errors, no duplicates.
-3. **Resolved vars:** dispatch with a dummy JSON → those variables appear.
-4. **Phase 2 (optional):** after `prod-checks` has run once,
-   `add_prod_check=true` → ruleset also requires `prod-checks`.
+3. **Resolved vars:** dispatch with a JSON of project ids → those
+   variables replace `PENDING`.
 
 ## Later integration
 

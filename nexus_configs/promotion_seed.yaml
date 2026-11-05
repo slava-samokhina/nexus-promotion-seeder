@@ -1,15 +1,11 @@
 # Desired promotion-pipeline shape for a target app repo.
-# Applied by .github/scripts/seed_promotion_pipelines.py via
-# .github/workflows/seed-promotion-pipelines.yaml.
+# Applied by .github/scripts/seed_promotion_pipelines.py.
 #
-# Workflow templates under templates/workflows/ are copied verbatim.
-# Per-repo values are repository variables (vars.*), set here or from
-# the resolved_vars dispatch input after GCP projects exist.
-#
-# Do not put the GitHub App private key here. Store the PEM as the
-# Actions secret NEXUS_APP_PRIVATE_KEY and the app Client ID as the
-# Actions variable NEXUS_APP_CLIENT_ID on this seeder repo (same pair
-# scion-deployment uses for Nexus-repo-creator).
+# The four workflow templates are copied verbatim from scion-testing.
+# Per-repo values are repository variables. Constants are identical on
+# every app. Project-specific names are created too; real values come
+# from resolved_vars once the GCP projects exist, otherwise the
+# placeholder below (GitHub rejects an empty variable value).
 
 tiers:
   uat:
@@ -17,22 +13,25 @@ tiers:
       - { src: templates/workflows/uat-pr-checks.yml, dest: .github/workflows/uat-pr-checks.yml }
       - { src: templates/workflows/uat-promote.yml,   dest: .github/workflows/uat-promote.yml }
     environment: uat
-    codeowners: "/release/uat/  @{{CODEOWNERS_OWNER}}"
+    codeowners_path: "/release/uat/"
     release_keep: templates/release/uat/.gitkeep
-    required_checks: [ "checks" ]          # job id in uat-pr-checks.yml; Actions integration 15368
+    required_checks: [ "uat-checks" ]   # job id in uat-pr-checks.yml
 
   prod:
     files:
-      - { src: templates/workflows/prod-open-promotion.yml,   dest: .github/workflows/prod-open-promotion.yml }
-      - { src: templates/workflows/prod-pr-checks.yml,        dest: .github/workflows/prod-pr-checks.yml }
-      - { src: templates/workflows/prod-merge-on-approval.yml, dest: .github/workflows/prod-merge-on-approval.yml }
-      - { src: templates/workflows/prod-promote.yml,          dest: .github/workflows/prod-promote.yml }
+      - { src: templates/workflows/prod-pr-checks.yml, dest: .github/workflows/prod-pr-checks.yml }
+      - { src: templates/workflows/prod-promote.yml,   dest: .github/workflows/prod-promote.yml }
     environment: prod
-    codeowners: "/release/prod/ @{{CODEOWNERS_OWNER}}"
+    codeowners_path: "/release/prod/"
     release_keep: templates/release/prod/.gitkeep
-    required_checks: [ "prod-checks" ]     # ADD ONLY in phase 2 (add_prod_check=true)
+    required_checks: [ "prod-checks" ]  # job id in prod-pr-checks.yml
 
-# Set on every seed — constant names, identical for every app
+# Removed from the promotion flow; deleted on the target if still present.
+retire_files:
+  - .github/workflows/prod-open-promotion.yml
+  - .github/workflows/prod-merge-on-approval.yml
+
+# Identical on every app — copied from scion-testing.
 variables_constant:
   GCP_REGION:      northamerica-northeast1
   DEV_AR_REPO:     apps
@@ -45,20 +44,23 @@ variables_constant:
   GCRANE_VERSION:  0.20.2
   RUNNER_LABELS:   '["ubuntu-24.04"]'
 
-# Known only after the GCP project exists — passed in at dispatch, skipped if absent
+# Exist on every seeded repo. Real values only after the GCP projects
+# exist; pass them in resolved_vars. Until then the placeholder is set.
 variables_from_input:
   - DEV_PROJECT_ID
   - UAT_PROJECT_ID
   - PROD_PROJECT_ID
-  - PROMOTER_SA          # uat-promoter@<project>.iam.gserviceaccount.com
-  - UAT_RUNTIME_SA       # runtime-sa-uat@<project>.iam.gserviceaccount.com
-  - PROD_PROMOTER_SA     # prod-promoter@<project>.iam.gserviceaccount.com
-  - PROD_RUNTIME_SA      # runtime-sa-prod@<project>.iam.gserviceaccount.com
-  - WIF_PROVIDER         # projects/<num>/locations/global/workloadIdentityPools/.../providers/...
+  - PROMOTER_SA
+  - UAT_RUNTIME_SA
+  - PROD_PROMOTER_SA
+  - PROD_RUNTIME_SA
+  - WIF_PROVIDER
+
+unset_placeholder: PENDING
 
 repo_settings:
   allow_auto_merge: true
-  actions_can_create_and_approve_prs: true   # prod button opens the PR; needs this on
+  actions_can_create_and_approve_prs: true
   default_workflow_permissions: read
 
 ruleset:
@@ -70,5 +72,4 @@ ruleset:
   required_approving_reviews: 0
   require_code_owner_review: true
   require_branches_up_to_date: false
-  # required_status_checks assembled from the selected tiers' required_checks
   actions_integration_id: 15368

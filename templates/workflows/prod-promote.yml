@@ -1,29 +1,21 @@
 name: PROD Promote
 
-# Fires after a prod promotion PR is merged to main (release/prod/** changed).
-# The human gate already happened on that PR (CODEOWNERS on /release/prod/).
-# This job does not pause again: `environment: prod` is only a deployment
-# record, with no required reviewers and no variables of its own.
+# Fires after a prod promotion PR auto-merges to main (release/prod/** changed).
+# The agent opens that PR with auto-merge. CODEOWNERS approval plus the
+# uat-checks and prod-checks statuses are both required before GitHub merges.
+# This job does not pause: `environment: prod` is only a deployment record.
 #
 # Copies the UAT image digest-for-digest into apps-prod, re-attests the new
-# prod image URL (Binary Authorization matches the full URL), deploys, smokes
-# /health, and shifts traffic. No rebuild. gcloud + gcrane only.
+# prod image URL (Binary Authorization matches the full URL), deploys, and
+# shifts traffic. /health is checked by the Cloud Run startup probe inside the
+# new revision. GitHub never calls the service URL, so a private or
+# sign-in-protected app still promotes. No rebuild. gcloud + gcrane only.
 
 on:
   push:
     branches: [main]
     paths:
       - "release/prod/**"
-  # Also invoked by prod-merge-on-approval.yml. A merge performed by this
-  # repo's GITHUB_TOKEN does not emit a push event, so the approval workflow
-  # calls this directly after it merges.
-  workflow_call:
-    inputs:
-      ref:
-        description: Commit to deploy. Defaults to the calling workflow's SHA.
-        type: string
-        required: false
-        default: ""
 
 permissions:
   contents: read
@@ -40,8 +32,6 @@ jobs:
     environment: prod
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
 
       - id: auth
         name: Authenticate to GCP (WIF, keyless)
@@ -125,6 +115,10 @@ jobs:
               FIRST_DEPLOY=1
             fi
 
+            # /health is probed inside the revision. A private service, IAP, or
+            # internal ingress never has to be reachable from the GitHub runner.
+            # Deploy fails, and traffic stays put, if /health does not return 200.
+            PROBE="httpGet.path=/health,httpGet.port=8080,timeoutSeconds=5,periodSeconds=10,failureThreshold=6"
             if [ "$FIRST_DEPLOY" = "1" ]; then
               echo "== 5. First deploy: create $SERVICE (serves traffic immediately) =="
               gcloud run deploy "$SERVICE" \
@@ -132,10 +126,9 @@ jobs:
                 --image="$PROD_IMAGE" \
                 --service-account="${{ vars.PROD_RUNTIME_SA }}" \
                 --binary-authorization=default \
-                --allow-unauthenticated --quiet
-              SMOKE_URL="$(gcloud run services describe "$SERVICE" \
-                --project="$PROD_PROJECT" --region="$REGION" \
-                --format='value(status.url)')"
+                --no-allow-unauthenticated \
+                --startup-probe="$PROBE" \
+                --quiet
             else
               echo "== 5. Deploy new revision with NO traffic, tagged 'candidate' =="
               gcloud run deploy "$SERVICE" \
@@ -144,28 +137,12 @@ jobs:
                 --service-account="${{ vars.PROD_RUNTIME_SA }}" \
                 --binary-authorization=default \
                 --no-traffic --tag=candidate \
-                --allow-unauthenticated --quiet
-              SMOKE_URL="$(gcloud run services describe "$SERVICE" \
-                --project="$PROD_PROJECT" --region="$REGION" --format=json \
-                | jq -r '.status.traffic[] | select(.tag=="candidate") | .url')"
+                --no-allow-unauthenticated \
+                --startup-probe="$PROBE" \
+                --quiet
             fi
 
-            echo "== 6. Smoke test (${SMOKE_URL}/health) =="
-            if [ -z "$SMOKE_URL" ] || [ "$SMOKE_URL" = "null" ]; then
-              echo "::error::Could not resolve a URL to smoke-test for $SERVICE."
-              exit 1
-            fi
-            CODE=""
-            for i in $(seq 1 12); do
-              CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${SMOKE_URL}/health" || true)"
-              echo "attempt $i: HTTP $CODE"
-              [ "$CODE" = "200" ] && break
-              sleep 5
-            done
-            if [ "$CODE" != "200" ]; then
-              echo "::error::Smoke test failed for $SERVICE (last HTTP $CODE). NOT promoting traffic."
-              exit 1
-            fi
+            echo "== 6. Startup probe passed: /health returned 200 inside the new revision =="
 
             if [ "$FIRST_DEPLOY" = "0" ]; then
               echo "== 7. Shift 100% of traffic to the new revision =="

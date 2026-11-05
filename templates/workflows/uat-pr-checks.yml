@@ -2,7 +2,7 @@
 # -----------------------------------------------------------------------------
 # PROMOTION-PR GATE + required status check on `main`.
 #
-# This runs on EVERY PR to main (intentionally NOT path-filtered) so the `checks`
+# This runs on EVERY PR to main (intentionally NOT path-filtered) so the `uat-checks`
 # status always reports — otherwise, as a required status check, it would block
 # normal dev PRs that never trigger it. For a non-promotion PR (no release/uat/**
 # change) it passes instantly with nothing to verify, so dev PRs stay ungated.
@@ -27,7 +27,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
+  uat-checks:
+    name: uat-checks
     runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     # No `environment:` here — reads repository-level vars; must not be gated.
     env:
@@ -42,7 +43,7 @@ jobs:
 
       # Decide: is this a UAT promotion PR (touches release/uat/**) or a normal dev
       # PR? Dev PRs skip every check below and the job passes — so the required
-      # `checks` status never blocks non-promotion work.
+      # `uat-checks` status never blocks non-promotion work.
       - name: Determine PR scope
         id: scope
         run: |

@@ -5,8 +5,9 @@ name: UAT Promote
 # The job declares `environment: uat`, which is the SINGLE HUMAN GATE: it pauses
 # for a Required Reviewer's approval before anything touches GCP. After approval
 # it copies the dev image digest-for-digest into the UAT repo, re-attests it for
-# the new UAT image URL, deploys to Cloud Run with no traffic, smoke-tests the
-# candidate, then shifts 100% of traffic.
+# the new UAT image URL, deploys to Cloud Run with no traffic, and shifts
+# traffic only after the in-revision /health startup probe passes. GitHub does
+# not call the service URL.
 
 on:
   push:
@@ -120,6 +121,10 @@ jobs:
               FIRST_DEPLOY=1
             fi
 
+            # /health is probed inside the revision. A private service, IAP, or
+            # internal ingress never has to be reachable from the GitHub runner.
+            # Deploy fails, and traffic stays put, if /health does not return 200.
+            PROBE="httpGet.path=/health,httpGet.port=8080,timeoutSeconds=5,periodSeconds=10,failureThreshold=6"
             if [ "$FIRST_DEPLOY" = "1" ]; then
               echo "== 5. First deploy: create $SERVICE (serves traffic immediately) =="
               gcloud run deploy "$SERVICE" \
@@ -127,10 +132,9 @@ jobs:
                 --image="$UAT_IMAGE" \
                 --service-account="${{ vars.UAT_RUNTIME_SA }}" \
                 --binary-authorization=default \
-                --allow-unauthenticated --quiet
-              SMOKE_URL="$(gcloud run services describe "$SERVICE" \
-                --project="$UAT_PROJECT" --region="$REGION" \
-                --format='value(status.url)')"
+                --no-allow-unauthenticated \
+                --startup-probe="$PROBE" \
+                --quiet
             else
               echo "== 5. Deploy new revision with NO traffic, tagged 'candidate' =="
               gcloud run deploy "$SERVICE" \
@@ -139,28 +143,12 @@ jobs:
                 --service-account="${{ vars.UAT_RUNTIME_SA }}" \
                 --binary-authorization=default \
                 --no-traffic --tag=candidate \
-                --allow-unauthenticated --quiet
-              SMOKE_URL="$(gcloud run services describe "$SERVICE" \
-                --project="$UAT_PROJECT" --region="$REGION" --format=json \
-                | jq -r '.status.traffic[] | select(.tag=="candidate") | .url')"
+                --no-allow-unauthenticated \
+                --startup-probe="$PROBE" \
+                --quiet
             fi
 
-            echo "== 6. Smoke test (${SMOKE_URL}/health) =="
-            if [ -z "$SMOKE_URL" ] || [ "$SMOKE_URL" = "null" ]; then
-              echo "::error::Could not resolve a URL to smoke-test for $SERVICE."
-              exit 1
-            fi
-            CODE=""
-            for i in $(seq 1 12); do
-              CODE="$(curl -sS -o /dev/null -w '%{http_code}' "${SMOKE_URL}/health" || true)"
-              echo "attempt $i: HTTP $CODE"
-              [ "$CODE" = "200" ] && break
-              sleep 5
-            done
-            if [ "$CODE" != "200" ]; then
-              echo "::error::Smoke test failed for $SERVICE (last HTTP $CODE). NOT promoting traffic."
-              exit 1
-            fi
+            echo "== 6. Startup probe passed: /health returned 200 inside the new revision =="
 
             if [ "$FIRST_DEPLOY" = "0" ]; then
               echo "== 7. Shift 100% of traffic to the new revision =="

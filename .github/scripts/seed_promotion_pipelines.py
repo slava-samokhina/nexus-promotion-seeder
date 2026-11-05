@@ -33,11 +33,18 @@ except ImportError:  # pragma: no cover - workflow installs PyYAML
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = ROOT / "nexus_configs" / "promotion_seed.yaml"
 CODEOWNERS_HEADER = """\
-# Code owners for promotion manifests.
+# Code owners for this repo.
 #
-# IMPORTANT: this is intentionally scoped ONLY to the promotion paths.
+# IMPORTANT: this is intentionally scoped ONLY to the promotion manifests.
 # It does NOT gate normal dev PRs — Scion agents keep creating/merging PRs freely.
 # A PR only requires an owner's approval if it touches a path listed below.
+#
+# This is the single human gate for UAT: a promotion PR (which only changes
+# release/uat/**) must be approved by an owner before it can auto-merge and deploy.
+#
+# Same gate for prod. The prod agent opens the PR with auto-merge; this
+# approval plus green checks are both required before it merges and deploys.
+# Dev PRs and UAT promotion PRs do not touch this path.
 """
 SECTION = "----------------------"
 
@@ -153,13 +160,50 @@ def resolve_tiers(manifest: dict, tiers_input: str) -> list[str]:
     return selected
 
 
-def normalize_owner_handle(raw: str) -> str:
-    """Accept '@user', 'user', or '@org/team' → strip a single leading @ for tmpl."""
-    handle = raw.strip()
-    if not handle:
-        die("codeowners_owner is empty")
-    # Manifest lines already include '@{{CODEOWNERS_OWNER}}'; store without @.
-    return handle[1:] if handle.startswith("@") else handle
+def parse_owner_handles(raw: str) -> list[str]:
+    """Split an optional CODEOWNERS_OWNER override into handles without @."""
+    handles: list[str] = []
+    for part in re.split(r"[\s,]+", (raw or "").strip()):
+        if not part:
+            continue
+        handles.append(part[1:] if part.startswith("@") else part)
+    return handles
+
+
+def discover_repo_admins(target_repo: str) -> list[str]:
+    """Admin users on the target repo. These become CODEOWNERS.
+
+    A personal repo's owner is an admin. On an org repo this is whoever
+    has admin (vending grants that to each project owner). Bots are skipped.
+    """
+    listed = gh_api(
+        "GET",
+        f"repos/{target_repo}/collaborators?permission=admin&per_page=100",
+    )
+    try:
+        users = json.loads(listed.stdout or "[]")
+    except json.JSONDecodeError:
+        die(f"could not parse collaborators: {listed.stdout}")
+    logins: list[str] = []
+    for user in users:
+        if not isinstance(user, dict):
+            continue
+        login = str(user.get("login") or "")
+        if not login or user.get("type") == "Bot" or login.endswith("[bot]"):
+            continue
+        if login not in logins:
+            logins.append(login)
+    owner = target_repo.split("/", 1)[0]
+    if owner not in logins:
+        status, _blob = _gh_api_raw("GET", f"users/{owner}")
+        if status == 200 and owner not in logins:
+            logins.insert(0, owner)
+    if not logins:
+        die(
+            f"no admin users on {target_repo} to write CODEOWNERS. "
+            "Pass CODEOWNERS_OWNER explicitly."
+        )
+    return logins
 
 
 def parse_resolved_vars(raw: str) -> dict[str, str]:
@@ -238,10 +282,17 @@ def write_seed_files(
     work: Path,
     manifest: dict,
     selected: list[str],
-    codeowners_owner: str,
+    codeowners: list[str],
 ) -> list[str]:
     written: list[str] = []
     tiers = manifest["tiers"]
+    owners = " ".join(f"@{h}" for h in codeowners)
+
+    for retired in manifest.get("retire_files") or []:
+        dest = work / retired
+        if dest.is_file():
+            dest.unlink()
+            log(f"removed retired file {retired}")
 
     for name in selected:
         tier = tiers[name]
@@ -257,7 +308,6 @@ def write_seed_files(
         keep_src = tier.get("release_keep")
         if keep_src:
             src = ROOT / keep_src
-            # dest path: release/<tier>/.gitkeep
             dest = work / "release" / name / ".gitkeep"
             dest.parent.mkdir(parents=True, exist_ok=True)
             if src.is_file():
@@ -266,16 +316,13 @@ def write_seed_files(
                 dest.write_text("")
             written.append(str(dest.relative_to(work)))
 
-    # CODEOWNERS: header + selected tier lines (idempotent rewrite of managed block).
     co_path = work / ".github" / "CODEOWNERS"
     co_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [CODEOWNERS_HEADER.rstrip(), ""]
     for name in selected:
-        line = (tiers[name].get("codeowners") or "").replace(
-            "{{CODEOWNERS_OWNER}}", codeowners_owner
-        )
-        if line:
-            lines.append(line)
+        path = tiers[name].get("codeowners_path")
+        if path:
+            lines.append(f"{path} {owners}")
     co_path.write_text("\n".join(lines) + "\n")
     written.append(".github/CODEOWNERS")
     return written
@@ -382,8 +429,15 @@ def set_variables(
     manifest: dict,
     resolved: dict[str, str],
 ) -> tuple[list[str], list[str]]:
+    """Create every variable. Unknown project values get a placeholder.
+
+    GitHub rejects an empty variable value, so names that are not in
+    resolved_vars are created as unset_placeholder (default PENDING).
+    A later dispatch with resolved_vars overwrites them.
+    """
     set_names: list[str] = []
-    skipped: list[str] = []
+    placeholders: list[str] = []
+    placeholder = str(manifest.get("unset_placeholder") or "PENDING")
 
     constants = manifest.get("variables_constant") or {}
     for name, value in constants.items():
@@ -405,25 +459,27 @@ def set_variables(
     for name in manifest.get("variables_from_input") or []:
         key = str(name)
         if key in resolved:
-            run(
-                [
-                    "gh",
-                    "variable",
-                    "set",
-                    key,
-                    "--repo",
-                    target_repo,
-                    "--body",
-                    resolved[key],
-                ],
-                check=True,
-            )
+            value = resolved[key]
             set_names.append(key)
         else:
-            skipped.append(key)
-            log(f"variable {key}: skipped (not in resolved_vars)")
+            value = placeholder
+            placeholders.append(key)
+            log(f"variable {key}: created as {placeholder} (no resolved value yet)")
+        run(
+            [
+                "gh",
+                "variable",
+                "set",
+                key,
+                "--repo",
+                target_repo,
+                "--body",
+                value,
+            ],
+            check=True,
+        )
 
-    return set_names, skipped
+    return set_names, placeholders
 
 
 def apply_repo_settings(target_repo: str, manifest: dict) -> None:
@@ -450,29 +506,18 @@ def apply_repo_settings(target_repo: str, manifest: dict) -> None:
     )
 
 
-def collect_required_checks(
-    manifest: dict,
-    selected: list[str],
-    add_prod_check: bool,
-) -> list[dict]:
+def collect_required_checks(manifest: dict, selected: list[str]) -> list[dict]:
     ruleset = manifest.get("ruleset") or {}
     integration_id = int(ruleset.get("actions_integration_id") or 15368)
     contexts: list[str] = []
     for name in selected:
         for ctx in (manifest["tiers"][name].get("required_checks") or []):
-            if ctx == "prod-checks" and not add_prod_check:
-                log("phase 1: omitting prod-checks from ruleset (add_prod_check=false)")
-                continue
             if ctx not in contexts:
                 contexts.append(ctx)
     return [{"context": c, "integration_id": integration_id} for c in contexts]
 
 
-def build_ruleset_payload(
-    manifest: dict,
-    selected: list[str],
-    add_prod_check: bool,
-) -> dict:
+def build_ruleset_payload(manifest: dict, selected: list[str]) -> dict:
     cfg = manifest.get("ruleset") or {}
     rules: list[dict] = []
     if cfg.get("block_deletion", True):
@@ -497,7 +542,7 @@ def build_ruleset_payload(
                 },
             }
         )
-    checks = collect_required_checks(manifest, selected, add_prod_check)
+    checks = collect_required_checks(manifest, selected)
     if checks:
         rules.append(
             {
@@ -548,9 +593,8 @@ def upsert_ruleset(
     target_repo: str,
     manifest: dict,
     selected: list[str],
-    add_prod_check: bool,
 ) -> str:
-    payload = build_ruleset_payload(manifest, selected, add_prod_check)
+    payload = build_ruleset_payload(manifest, selected)
     name = payload["name"]
 
     status, blob = _gh_api_raw("GET", f"repos/{target_repo}/rulesets")
@@ -615,14 +659,8 @@ def main() -> None:
         die(f"TARGET_REPO must be owner/repo, got {target_repo!r}")
 
     tiers_input = os.environ.get("TIERS", "both")
-    codeowners_owner = normalize_owner_handle(env("CODEOWNERS_OWNER"))
     push_mode = os.environ.get("PUSH_MODE", "direct")
     apply_ruleset = os.environ.get("APPLY_RULESET", "true").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    add_prod_check = os.environ.get("ADD_PROD_CHECK", "false").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -634,13 +672,19 @@ def main() -> None:
 
     manifest = load_manifest()
     selected = resolve_tiers(manifest, tiers_input)
+    codeowners = parse_owner_handles(os.environ.get("CODEOWNERS_OWNER", ""))
+    if codeowners:
+        log(f"codeowners from CODEOWNERS_OWNER: {codeowners}")
+    else:
+        codeowners = discover_repo_admins(target_repo)
+        log(f"codeowners from repo admins: {codeowners}")
 
     log(SECTION)
     log(f"target:     {target_repo}")
     log(f"tiers:      {', '.join(selected)}")
     log(f"push_mode:  {push_mode}")
-    log(f"ruleset:    {apply_ruleset} (add_prod_check={add_prod_check})")
-    log(f"codeowners: @{codeowners_owner}")
+    log(f"ruleset:    {apply_ruleset}")
+    log(f"codeowners: {' '.join('@' + h for h in codeowners)}")
     log(SECTION)
 
     summary: dict = {}
@@ -648,7 +692,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="promo-seed-") as tmp:
         work = Path(tmp) / "repo"
         branch = ensure_target_clone(target_repo, work)
-        written = write_seed_files(work, manifest, selected, codeowners_owner)
+        written = write_seed_files(work, manifest, selected, codeowners)
         push_result = commit_and_push(
             work, target_repo, branch, selected, push_mode
         )
@@ -665,9 +709,10 @@ def main() -> None:
     summary["environments"] = envs
 
     # Variables
-    set_names, skipped = set_variables(target_repo, manifest, resolved)
+    set_names, placeholders = set_variables(target_repo, manifest, resolved)
     summary["variables_set"] = set_names
-    summary["variables_skipped"] = skipped
+    summary["variables_placeholder"] = placeholders
+    summary["codeowners"] = codeowners
 
     # Repo settings
     apply_repo_settings(target_repo, manifest)
@@ -675,9 +720,7 @@ def main() -> None:
 
     # Ruleset last — do not lock out the file push above.
     if apply_ruleset:
-        summary["ruleset"] = upsert_ruleset(
-            target_repo, manifest, selected, add_prod_check
-        )
+        summary["ruleset"] = upsert_ruleset(target_repo, manifest, selected)
     else:
         summary["ruleset"] = "skipped"
         log("ruleset: skipped (APPLY_RULESET=false)")

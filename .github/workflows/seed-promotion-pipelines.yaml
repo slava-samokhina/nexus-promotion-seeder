@@ -36,8 +36,9 @@ on:
         default: both
         type: string
       codeowners_owner:
-        description: "CODEOWNERS handle without or with @ (e.g. slava-samokhina or @org/team)"
-        required: true
+        description: "Optional override. Empty = every admin on the target repo (you, if you own it)."
+        required: false
+        default: ""
         type: string
       push_mode:
         description: "direct | pr  (direct for first seed before ruleset exists)"
@@ -48,11 +49,6 @@ on:
         description: "true | false"
         required: false
         default: "true"
-        type: string
-      add_prod_check:
-        description: "phase 2: add prod-checks to the ruleset after it has run once"
-        required: false
-        default: "false"
         type: string
       resolved_vars:
         description: 'JSON of after-project vars, e.g. {"UAT_PROJECT_ID":"...","WIF_PROVIDER":"..."}'
@@ -123,6 +119,5 @@ jobs:
           CODEOWNERS_OWNER: ${{ github.event.inputs.codeowners_owner }}
           PUSH_MODE: ${{ github.event.inputs.push_mode }}
           APPLY_RULESET: ${{ github.event.inputs.apply_ruleset }}
-          ADD_PROD_CHECK: ${{ github.event.inputs.add_prod_check }}
           RESOLVED_VARS: ${{ github.event.inputs.resolved_vars }}
         run: python3 .github/scripts/seed_promotion_pipelines.py
